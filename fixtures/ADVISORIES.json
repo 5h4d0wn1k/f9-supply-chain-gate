@@ -1,0 +1,30 @@
+[
+  {
+    "id": "F9-ADV-2026-001",
+    "package": "synthetlib",
+    "affected": ">=2.0.0,<2.1.0",
+    "severity": "HIGH",
+    "advisory": "Synthetic advisory: remote code execution in the JSON parser of synthetlib 2.0.x (example data only)."
+  },
+  {
+    "id": "F9-ADV-2026-002",
+    "package": "fictitiouscore",
+    "affected": "<=0.9.3",
+    "severity": "MEDIUM",
+    "advisory": "Synthetic advisory: authentication bypass in fictitiouscore 0.9.3 and earlier (example data only)."
+  },
+  {
+    "id": "F9-ADV-2026-003",
+    "package": "decoyutil",
+    "affected": ">=3.0.0,<3.3.3",
+    "severity": "LOW",
+    "advisory": "Synthetic advisory: weak default entropy in decoyutil token generation (example data only)."
+  },
+  {
+    "id": "F9-ADV-2026-004",
+    "package": "example-framework",
+    "affected": "==1.1.0",
+    "severity": "CRITICAL",
+    "advisory": "Synthetic advisory: command injection in example-framework 1.1.0 (example data only)."
+  }
+]

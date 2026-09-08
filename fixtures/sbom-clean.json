@@ -1,0 +1,47 @@
+{
+  "bomFormat": "CycloneDX",
+  "specVersion": "1.4",
+  "serialNumber": "urn:uuid:00000000-1111-2222-3333-444444444444",
+  "version": 1,
+  "metadata": {
+    "component": {
+      "type": "application",
+      "name": "demo-service.example",
+      "version": "1.0.0"
+    }
+  },
+  "components": [
+    {
+      "type": "library",
+      "bom-ref": "pkg:pypi/example-framework@1.0.0",
+      "name": "example-framework",
+      "version": "1.0.0",
+      "purl": "pkg:pypi/example-framework@1.0.0",
+      "licenses": [{"license": {"id": "MIT"}}]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:pypi/synthetlib@2.1.0",
+      "name": "synthetlib",
+      "version": "2.1.0",
+      "purl": "pkg:pypi/synthetlib@2.1.0",
+      "licenses": [{"license": {"id": "Apache-2.0"}}]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:pypi/fictitiouscore@0.9.4",
+      "name": "fictitiouscore",
+      "version": "0.9.4",
+      "purl": "pkg:pypi/fictitiouscore@0.9.4",
+      "licenses": [{"license": {"id": "BSD-3-Clause"}}]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:pypi/decoyutil@3.3.3",
+      "name": "decoyutil",
+      "version": "3.3.3",
+      "purl": "pkg:pypi/decoyutil@3.3.3",
+      "licenses": [{"license": {"id": "ISC"}}]
+    }
+  ]
+}

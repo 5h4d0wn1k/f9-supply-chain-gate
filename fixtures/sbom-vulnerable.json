@@ -1,0 +1,47 @@
+{
+  "bomFormat": "CycloneDX",
+  "specVersion": "1.4",
+  "serialNumber": "urn:uuid:aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+  "version": 1,
+  "metadata": {
+    "component": {
+      "type": "application",
+      "name": "legacy-backend.example",
+      "version": "2.0.0"
+    }
+  },
+  "components": [
+    {
+      "type": "library",
+      "bom-ref": "pkg:pypi/example-framework@1.1.0",
+      "name": "example-framework",
+      "version": "1.1.0",
+      "purl": "pkg:pypi/example-framework@1.1.0",
+      "licenses": [{"license": {"id": "MIT"}}]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:pypi/synthetlib@2.0.5",
+      "name": "synthetlib",
+      "version": "2.0.5",
+      "purl": "pkg:pypi/synthetlib@2.0.5",
+      "licenses": [{"license": {"id": "Apache-2.0"}}]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:pypi/fictitiouscore@0.9.2",
+      "name": "fictitiouscore",
+      "version": "0.9.2",
+      "purl": "pkg:pypi/fictitiouscore@0.9.2",
+      "licenses": [{"license": {"id": "BSD-3-Clause"}}]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:pypi/proprietary-sdk@1.2.0",
+      "name": "proprietary-sdk",
+      "version": "1.2.0",
+      "purl": "pkg:pypi/proprietary-sdk@1.2.0",
+      "licenses": [{"license": {"name": "Proprietary"}}]
+    }
+  ]
+}

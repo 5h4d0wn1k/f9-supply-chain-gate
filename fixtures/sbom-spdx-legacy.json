@@ -1,0 +1,33 @@
+{
+  "spdxVersion": "SPDX-2.3",
+  "dataLicense": "CC0-1.0",
+  "SPDXID": "SPDXRef-DOCUMENT",
+  "name": "legacy-bundle.example",
+  "documentNamespace": "https://example.com/spdxdocs/legacy-bundle-2026",
+  "packages": [
+    {
+      "SPDXID": "SPDXRef-PKG-framework",
+      "name": "example-framework",
+      "versionInfo": "1.0.0",
+      "licenseConcluded": "MIT"
+    },
+    {
+      "SPDXID": "SPDXRef-PKG-core",
+      "name": "legacy-core",
+      "versionInfo": "4.5.1",
+      "licenseConcluded": "GPL-3.0-only"
+    },
+    {
+      "SPDXID": "SPDXRef-PKG-helper",
+      "name": "mystery-helper",
+      "versionInfo": "2.0.0",
+      "licenseConcluded": "NOASSERTION"
+    },
+    {
+      "SPDXID": "SPDXRef-PKG-tool",
+      "name": "corp-internal-tool",
+      "versionInfo": "0.1.0",
+      "licenseDeclared": "NONE"
+    }
+  ]
+}

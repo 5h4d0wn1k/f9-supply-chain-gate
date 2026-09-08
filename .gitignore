@@ -2,3 +2,9 @@ __pycache__/
 *.pyc
 *.pyo
 .DS_Store
+reports/
+dist/
+build/
+*.egg-info/
+node_modules/
+.venv/

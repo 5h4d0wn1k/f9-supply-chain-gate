@@ -1,0 +1,6 @@
+{
+  "default_fixture": "clean",
+  "advisories_file": null,
+  "strict": false,
+  "report": "reports/report.md"
+}
